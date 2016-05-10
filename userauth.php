@@ -1,118 +1,183 @@
 <?php
-	session_start();
-	class userauth {
+	require 'vendor/autoload.php'; // I am using Flight Framework .. adapt as needed
 	
-		//Choose a unique salt. The longer and more complex it is, the better.
-		//Since the database is being stored in an unencrypted file, we need
-		//strong protection on the passwords.
-		
-		private $salt = "@#6$%^&*THIS$%^&IS(&^A%^&LARGE^&**%^&SALT-8,/7%^&*";
-		private $dbfile = "userauth.db";
-		private $db = -1;
-		
-		public function dbinit() {
-			if ($this->db == -1) 
-				$this->db = sqlite_open($this->dbfile, 0666, $e) or die($e);
-		}
-		
-		public function dbclose() {
-			if ($this->db != -1) {
-				sqlite_close($this->db);
-				$db = -1;
+	session_start();
+
+	// Choose a unique salt. The longer and more complex it is, the better.
+	// Since the database is being stored in an unencrypted file, we need
+	// strong protection on the passwords.
+	private $salt = "ThisIsADummySalt";
+	private $dbfile = null;
+	private $pdo = null;
+	private $db = null;
+	private $dbpersistent = false;
+	public function __construct() {
+		$this->dbfile = Flight::get ( 'pdo.local.path' );
+		$this->pdo = Flight::get ( 'pdo.local.scheme' ) . Flight::get ( 'pdo.local.path' );
+	}
+	public function dbinit() {
+		if ($this->db == null) {
+			try {
+				$this->db = new PDO ( $this->pdo, '', '', array (
+						PDO::ATTR_PERSISTENT => $this->dbpersistent
+				) );
+			} catch ( PDOException $e ) {
+				die ( $e->getMessage () );
 			}
-				
 		}
-		
-		public function createTables() {
-			$q = "CREATE TABLE users 
-									(	uid INTEGER PRIMARY KEY,
-										username varchar(255),
-										password varchar(32),
-										lastlogin int
-									);";
-			sqlite_exec($this->db, $q, $e) or 
-			die("The database table already exists. Please remove createTables() from your code<br />".$e);
-			
-			die("The database and tables were created. Please remove createTables() from userauth.php now.");
+	}
+	public function dbclose() {
+		if ($this->db != null) {
+			$this->db = null;
 		}
-		
-		public function login($user, $password, $stayloggedin = false) {
-			$user = sqlite_escape_string($user);
-			$password = md5($salt.$password);
-			
-			$q = "SELECT * FROM users WHERE username = '$user' AND password = '$password' LIMIT 1";
-			$res = sqlite_query($this->db, $q, $e);
-			if (sqlite_num_rows($res) > 0) {
-				if ($stayloggedin) {
-					
-					$r = sqlite_fetch_array($res);
-					setcookie("userid", $r['uid'], time() + 60 * 60 * 24 * 30);
-					setcookie("pass", $password, time() + 60 * 60 * 24 * 30);
-				}
-				$_SESSION['uid'] = $r['uid'];
-				$_SESSION['uname'] = $r['username'];
-				$time = time();
-				$id = $r['uid'];
-				sqlite_exec($this->db, "UPDATE users SET lastlogin = '$time' WHERE uid = '$id'", $e);
-				return true;
-			}
+	}
+	public function createTables() {
+		$ret = true;
+		try {
+			$stmt = $this->db->query ( "SELECT * FROM users LIMIT 1" );
+			if ($stmt === false)
+				$ret = false;
+		} catch ( PDOException $e ) {
+			$ret = false;
+		}
+		if ($ret)
+			return;
+		$q = "CREATE TABLE users
+							(	uid INTEGER PRIMARY KEY,
+								username varchar(255),
+								password varchar(32),
+								lastlogin int
+							);";
+		try {
+			$stmt = $this->db->prepare ( $q );
+			$stmt->execute ();
+		} catch ( PDOException $e ) {
+			die ( "Failed to create the database table: " . $e->getMessage () );
+		}
+		$this->newUser ( "admin", "adminDefaultPassword" );
+	}
+	public function login($user, $password, $stayloggedin = false) {
+		$stmt = $this->db->prepare ( "SELECT * FROM users WHERE username = :user AND password = :password LIMIT 1" );
+		$password = md5 ( $this->salt . $password );
+		$stmt->bindValue ( ':user', $user, PDO::PARAM_STR );
+		$stmt->bindValue ( ':password', $password, PDO::PARAM_STR );
+		$cnt = 0;
+		$r = array ();
+		if ($stmt->execute ()) {
+			$r = $stmt->fetchAll ();
+			$cnt = count ( $r );
+			// $row = $stmt->fetch();
+		} else {
+			$error = $stmt->errorInfo ();
 			return false;
 		}
-		
-		//Returns false if username is taken
-		public function newUser($username, $password) {
-			$user = sqlite_escape_string($username);
-			$pass = md5($salt.$password);
-			$time = time();
-			$checkuser = sqlite_query($this->db, "SELECT uid FROM users WHERE username = '$user'", $e);
-			if (sqlite_num_rows($checkuser) > 0)
+
+		if ($cnt > 0) {
+			if ($stayloggedin) {
+				setcookie ( "userid", $r ['uid'], time () + 60 * 60 * 24 * 30 );
+				setcookie ( "pass", $password, time () + 60 * 60 * 24 * 30 );
+			}
+			$_SESSION ['uid'] = $r [0] ['uid'];
+			$_SESSION ['uname'] = $r [0] ['username'];
+			$time = time ();
+			$id = $r [0] ['uid'];
+			$stmt = $this->db->prepare ( "UPDATE users SET lastlogin = :time WHERE uid = :id" );
+			$stmt->bindValue ( ':time', $time, PDO::PARAM_INT );
+			$stmt->bindValue ( ':id', $id, PDO::PARAM_INT );
+			try {
+				$stmt->execute ();
+				return true;
+			} catch ( PDOException $e ) {
 				return false;
-			$q = "INSERT INTO users VALUES (NULL, '$user', '$pass', '$time')";
-			
-			return sqlite_query($this->db, $q, $e) or die($e);
-		}
-		
-		public function updatePassword($username, $cpass, $newpass) {
-			if (!$this->login($username, $cpass)) return false;
-			
-			// escaping session data is probably unnecessary, but better safe than sorry
-			$id = sqlite_escape_string($_SESSION['uid']); 
-			$q = "UPDATE users SET password = '$newpass' WHERE uid = '$id' AND password = '$cpass'";
-			return sqlite_query($this->db, $q, $e);
-		}
-		
-		public function cookielogin() {
-			if (isset($_COOKIE['userid']) && isset($_COOKIE['pass'])) {
-				$id = sqlite_escape_string($_COOKIE['userid']);
-				$pass = sqlite_escape_string($_COOKIE['pass']);
-				$q = sqlite_query($this->db, "SELECT * FROM users WHERE uid = '$id' AND password = '$pass' LIMIT 1", $e);
-				if (sqlite_num_rows($q) > 0) {
-					$r = sqlite_fetch_array($q);
-					$_SESSION['uid'] = $r['uid'];
-					$_SESSION['uname'] = $r['username'];
-				} 
-				
 			}
 		}
-		public function isloggedin() {
-			return isset($_SESSION['uid']);
-		}
-		public function logout() {
-			unset($_SESSION['uid']);
-			session_destroy();
-			setcookie("userid", "", time() - 60 * 60 * 24 * 30);
-			setcookie("pass", "", time() - 60 * 60 * 24 * 30);
-		}
-		public function uname() {
-			if ($this->isloggedin()) 
-				return $_SESSION['uname'];
-			else 
-				return "NO LOGIN.";
-		}
-		
-		
+		return false;
 	}
-	$u = new userauth();
-	$u->dbinit();
+
+	// Returns false if username is taken
+	public function newUser($username, $password) {
+		$user = $username;
+		$pass = md5 ( $this->salt . $password );
+		$time = time ();
+		$stmt = $this->db->prepare ( "SELECT uid FROM users WHERE username = :username" );
+		$stmt->bindValue ( ':username', $user, PDO::PARAM_STR );
+		if ($stmt->execute ()) {
+			$res = $stmt->fetchAll ();
+			$cnt = count ( $res );
+			// $row = $stmt->fetch();
+		} else {
+			$error = $stmt->errorInfo ();
+			return false;
+		}
+		if ($res > 0)
+			return false;
+
+		$stmt = $this->db->prepare ( "INSERT INTO users ('username', 'password', 'lastlogin') VALUES (:username, :pass, :time)" );
+		$stmt->bindValue ( ':time', $time, PDO::PARAM_INT );
+		$stmt->bindValue ( ':username', $user, PDO::PARAM_STR );
+		$stmt->bindValue ( ':pass', $pass, PDO::PARAM_STR );
+		try {
+			$stmt->execute ();
+		} catch ( PDOException $e ) {
+			return false;
+		}
+		return true;
+	}
+	public function updatePassword($username, $cpass, $newpass) {
+		if (! $this->login ( $username, $cpass ))
+			return false;
+		$id = $_SESSION ['uid'];
+		$stmt = $this->db->prepare ( "UPDATE users SET password = :newpass WHERE uid = :id AND password = :cpass" );
+		$stmt->bindParam ( ':cpass', $cpass, PDO::PARAM_STR );
+		$stmt->bindParam ( ':id', $id, PDO::PARAM_INT );
+		$stmt->bindParam ( ':newpass', $newpass, PDO::PARAM_STR );
+		try {
+			$stmt->execute ();
+		} catch ( PDOException $e ) {
+			return false;
+		}
+		return true;
+	}
+	public function cookielogin() {
+		if (isset ( $_COOKIE ['userid'] ) && isset ( $_COOKIE ['pass'] )) {
+			$id = $_COOKIE ['userid'];
+			$pass = $_COOKIE ['pass'];
+
+			$stmt = $this->db->prepare ( "SELECT * FROM users WHERE uid = :id AND password = :pass LIMIT 1" );
+			$stmt->bindParam ( ':id', $id, PDO::PARAM_INT );
+			$stmt->bindParam ( ':pass', $pass, PDO::PARAM_STR );
+			try {
+				$stmt->execute ();
+			} catch ( PDOException $e ) {
+				return false;
+			}
+
+			$r = $stmt->fetchAll ();
+			$cnt = count ( $r );
+			if ($r > 0) {
+				$_SESSION ['uid'] = $r [0] ['uid'];
+				$_SESSION ['uname'] = $r [0] ['username'];
+			}
+		}
+	}
+	public function isloggedin() {
+		return isset ( $_SESSION ['uid'] );
+	}
+	public function logout() {
+		unset ( $_SESSION ['uid'] );
+		session_destroy ();
+		setcookie ( "userid", "", time () - 60 * 60 * 24 * 30 );
+		setcookie ( "pass", "", time () - 60 * 60 * 24 * 30 );
+	}
+	public function uname() {
+		if ($this->isloggedin ())
+			return $_SESSION ['uname'];
+		else
+			return "NO LOGIN.";
+	}
+}
+$user = new userauth ();
+$user->dbinit ();
+$user->createTables ();
 	
 ?>
